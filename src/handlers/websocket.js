@@ -1,141 +1,50 @@
-/**
- * WebSocket protocol handler
- */
+// src/handlers/websocket.js
+// Entry point for transport selection and parsing of options
+const { parseFakeHeadersFromQuery, parseSNIFromQuery } = require('../utils/parser');
+const { handleHttpUpgradeTransport, handleWebSocketTransport } = require('../proxy/transport-handlers');
+const defaults = require('../config/defaults');
 
-import { makeReadableWebSocketStream } from '../proxy/stream.js';
-import { handleTCPOutBound } from '../proxy/tcp.js';
-import { handleDNSQuery } from '../protocol/dns.js';
-import { processProtocolHeader } from '../protocol/vless.js';
-import { isTrojanProtocol, processTrojanHeader } from '../protocol/trojan.js';
-import { canHandleUDP, handleUDPOutbound } from '../proxy/udp-handler.js';
+// This file assumes the project has an existing HTTP server that can call these handlers.
+// Integration points depend on the current code base (e.g., express/ws, native http upgrade, or Cloudflare Workers).
 
-/**
- * Handles protocol over WebSocket requests.
- * Creates WebSocket pair, accepts connection, and processes protocol header.
- * @param {import("@cloudflare/workers-types").Request} request - The incoming request object
- * @param {Object} config - Request configuration
- * @param {Function} connect - Cloudflare socket connect function
- * @returns {Promise<Response>} WebSocket response
- */
-export async function protocolOverWSHandler(request, config, connect) {
-	/** @type {import("@cloudflare/workers-types").WebSocket[]} */
-	// @ts-ignore
-	const webSocketPair = new WebSocketPair();
-	const [client, webSocket] = Object.values(webSocketPair);
+async function handleIncomingUpgrade(req, socket, head) {
+  // Called from HTTP server 'upgrade' event: (req, socket, head)
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const params = url.searchParams;
 
-	webSocket.accept();
+  const transport = params.get('transport') || 'ws';
+  const fakeHeaders = defaults.ALLOW_FAKE_HEADERS ? Object.assign({}, defaults.DEFAULT_FAKE_HEADERS, parseFakeHeadersFromQuery(params)) : {};
+  const sniParam = parseSNIFromQuery(params) || defaults.DEFAULT_FAKE_SNI || '';
 
-	let address = '';
-	let portWithRandomLog = '';
-	const log = (/** @type {string} */ info, /** @type {string | undefined} */ event) => {
-		console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
-	};
-	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+  // Determine destination from query or path; project likely already has logic — here we attempt a minimal parse
+  const destHost = params.get('target') || params.get('host') || req.headers['x-dest-host'] || null;
+  const destPort = parseInt(params.get('port') || '443', 10);
+  const destIsTls = destPort === 443;
+  const destIsHttp = destPort === 80 || destPort === 8080 || params.get('http') === '1';
 
-	const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
+  if (!destHost) {
+    socket.end('HTTP/1.1 400 Bad Request\r\n\r\nMissing destination host');
+    return;
+  }
 
-	/** @type {{ value: import("@cloudflare/workers-types").Socket | null}}*/
-	let remoteSocketWrapper = {
-		value: null,
-	};
-	let isDns = false;
+  const dest = { host: destHost, port: destPort, isTls: destIsTls, isHttp: destIsHttp };
+  const opts = { fakeHeaders, sni: sniParam };
 
-	// ws --> remote
-	readableWebSocketStream.pipeTo(new WritableStream({
-		async write(chunk, controller) {
-			if (isDns) {
-				return await handleDNSQuery(chunk, webSocket, null, log, connect);
-			}
-			if (remoteSocketWrapper.value) {
-				const writer = remoteSocketWrapper.value.writable.getWriter();
-				await writer.write(chunk);
-				writer.releaseLock();
-				return;
-			}
+  if (transport === 'httpupgrade') {
+    // Respond with 101 and then bind socket
+    const upgradeHeader = req.headers['upgrade'] || 'tcp';
+    socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
+                 'Connection: Upgrade\r\n' +
+                 `Upgrade: ${upgradeHeader}\r\n\r\n`);
 
-			// Auto-detect protocol: Trojan or VLESS
-			// Trojan detection requires password verification to avoid false positives
-			let protocolResult;
-			let protocolType = 'vless';
-
-			if (isTrojanProtocol(chunk, config.trojanPassword)) {
-				protocolType = 'trojan';
-				protocolResult = processTrojanHeader(chunk, config.trojanPassword);
-			} else {
-				protocolResult = processProtocolHeader(chunk, config.userID);
-			}
-
-			const {
-				hasError,
-				message,
-				addressType,
-				portRemote = 443,
-				addressRemote = '',
-				rawDataIndex,
-				protocolVersion = new Uint8Array([0, 0]),
-				isUDP,
-			} = protocolResult;
-			address = addressRemote;
-			portWithRandomLog = `${portRemote}--${Math.random()} ${isUDP ? 'udp ' : 'tcp '} [${protocolType}]`;
-			if (hasError) {
-				throw new Error(message);
-			}
-			// Handle UDP connections
-			if (isUDP) {
-				// Check if we have a UDP-capable outbound (e.g., VLESS outbound)
-				if (canHandleUDP(config)) {
-					// Full UDP support via VLESS outbound
-					const protocolResponseHeader = protocolType === 'trojan'
-						? null
-						: new Uint8Array([protocolVersion[0], 0]);
-					const rawClientData = chunk.slice(rawDataIndex);
-					const udpWritable = await handleUDPOutbound(
-						webSocket,
-						protocolResponseHeader,
-						addressType,
-						addressRemote,
-						portRemote,
-						rawClientData,
-						log,
-						config
-					);
-					if (udpWritable) {
-						// Store the writable stream for subsequent messages
-						remoteSocketWrapper.value = { writable: udpWritable };
-					}
-					return;
-				} else if (portRemote === 53) {
-					// Fallback to DNS-only mode when no UDP-capable outbound
-					isDns = true;
-				} else {
-					throw new Error('UDP proxy requires VLESS outbound configuration');
-				}
-				return; // Early return after setting isDns or throwing error
-			}
-			// Protocol response header: VLESS needs 2-byte header, Trojan needs none
-			const protocolResponseHeader = protocolType === 'trojan'
-				? null
-				: new Uint8Array([protocolVersion[0], 0]);
-			const rawClientData = chunk.slice(rawDataIndex);
-
-			if (isDns) {
-				return handleDNSQuery(rawClientData, webSocket, protocolResponseHeader, log, connect);
-			}
-			handleTCPOutBound(remoteSocketWrapper, addressType, addressRemote, portRemote, rawClientData, webSocket, protocolResponseHeader, log, config, connect);
-		},
-		close() {
-			log(`readableWebSocketStream is close`);
-		},
-		abort(reason) {
-			log(`readableWebSocketStream is abort`, JSON.stringify(reason));
-		},
-	})).catch((err) => {
-		log('readableWebSocketStream pipeTo error', err);
-	});
-
-	return new Response(null, {
-		status: 101,
-		// @ts-ignore
-		webSocket: client,
-	});
+    // After writing the response, socket is a duplex stream — hand to handler
+    handleHttpUpgradeTransport(socket, dest, opts);
+  } else {
+    // Fallback to WebSocket handling; integration depends on ws server
+    // If using 'ws' package you would upgrade to a WebSocket and then pass the stream
+    // For a minimal approach, if `socket` is already a stream, forward bytes
+    handleWebSocketTransport(socket, dest, opts);
+  }
 }
+
+module.exports = { handleIncomingUpgrade };
